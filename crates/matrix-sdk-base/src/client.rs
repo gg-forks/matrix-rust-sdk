@@ -889,6 +889,21 @@ impl BaseClient {
             return Ok(());
         };
 
+        // Capture the currently-known active members *before* applying the reloaded
+        // member list, so we can tell a genuine membership change apart from a no-op
+        // reload (e.g. a client restart that re-fetches `/members`). Only the former
+        // should rotate the room key.
+        #[cfg(feature = "e2e-encryption")]
+        let previously_known_user_ids = match room.members(RoomMemberships::ACTIVE).await {
+            Ok(members) => {
+                Some(members.into_iter().map(|m| m.user_id().to_owned()).collect::<BTreeSet<_>>())
+            }
+            Err(e) => {
+                tracing::warn!("Error loading known members before a full reload: {e:?}");
+                None
+            }
+        };
+
         let mut chunk = Vec::with_capacity(response.chunk.len());
         let mut context = Context::default();
 
@@ -980,10 +995,24 @@ impl BaseClient {
             // With the introduction of MSC4268, it is no longer sufficient to check for
             // changes to session recipients when we send a message, since we may miss
             // join/leave pairs in our view of the room state. Instead, we should rotate
-            // the room key whenever we fully reload the member list as a precaution.
-            tracing::debug!("Rotating room key due to full member list reload");
-            if let Err(e) = olm.discard_room_key(room_id).await {
-                tracing::warn!("Error discarding room key: {e:?}");
+            // the room key whenever we fully (re)load the member list *and the active
+            // member set actually changed*. A reload that returns the same membership
+            // (e.g. a restart re-fetching `/members`) must not rotate, or unrelated
+            // outbound group sessions would be needlessly discarded.
+            //
+            // If we couldn't read the previously-known members, be conservative and
+            // rotate.
+            let membership_changed =
+                reload_requires_room_key_rotation(previously_known_user_ids.as_ref(), &user_ids);
+            if membership_changed {
+                tracing::debug!("Rotating room key due to full member list reload");
+                if let Err(e) = olm.discard_room_key(room_id).await {
+                    tracing::warn!("Error discarding room key: {e:?}");
+                }
+            } else {
+                tracing::debug!(
+                    "Not rotating room key: full member list reload had no active member changes"
+                );
             }
         }
 
@@ -1283,6 +1312,20 @@ impl From<&v5::Request> for RequestedRequiredStates {
     }
 }
 
+/// Returns whether a full member-list reload should rotate the room key.
+///
+/// A reload that leaves the active member set unchanged (e.g. a client restart
+/// re-fetching `/members`) must not rotate, or unrelated outbound group sessions
+/// would be needlessly discarded. A genuine membership change must rotate. If the
+/// previously-known membership can't be determined, be conservative and rotate.
+#[cfg(feature = "e2e-encryption")]
+fn reload_requires_room_key_rotation(
+    previous: Option<&BTreeSet<OwnedUserId>>,
+    current: &BTreeSet<OwnedUserId>,
+) -> bool {
+    previous.map_or(true, |previous| previous != current)
+}
+
 /// An enum that defines what the [`BaseClient`] should consider a DM room.
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
@@ -1298,7 +1341,7 @@ pub enum DmRoomDefinition {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     use assert_matches2::assert_let;
     #[cfg(feature = "e2e-encryption")]
@@ -1318,6 +1361,7 @@ mod tests {
         api::client::{self as api, sync::sync_events::v5},
         event_id,
         events::{StateEventType, room::member::MembershipState},
+        owned_user_id,
         room_id,
         serde::Raw,
         user_id,
@@ -1325,6 +1369,8 @@ mod tests {
     use serde_json::{json, value::to_raw_value};
 
     use super::{BaseClient, RequestedRequiredStates};
+    #[cfg(feature = "e2e-encryption")]
+    use super::reload_requires_room_key_rotation;
     use crate::{
         DmRoomDefinition, RoomDisplayName, RoomState, SessionMeta,
         client::ThreadingSupport,
@@ -1333,6 +1379,23 @@ mod tests {
     };
     #[cfg(feature = "unstable-msc4426")]
     use crate::{RoomMemberships, store::StateChanges};
+
+    #[test]
+    #[cfg(feature = "e2e-encryption")]
+    fn member_reload_rotation_decision() {
+        let a = BTreeSet::from([owned_user_id!("@a:e.uk")]);
+        let a_again = BTreeSet::from([owned_user_id!("@a:e.uk")]);
+        let a_plus_b = BTreeSet::from([owned_user_id!("@a:e.uk"), owned_user_id!("@b:e.uk")]);
+        let b_only = BTreeSet::from([owned_user_id!("@b:e.uk")]);
+
+        // Previously-unknown membership: conservative, rotate.
+        assert!(reload_requires_room_key_rotation(None, &a));
+        // Same active set (restart re-fetching `/members`): no discard.
+        assert!(!reload_requires_room_key_rotation(Some(&a), &a_again));
+        // Genuine add / remove: discard.
+        assert!(reload_requires_room_key_rotation(Some(&a), &a_plus_b));
+        assert!(reload_requires_room_key_rotation(Some(&a_plus_b), &b_only));
+    }
 
     #[test]
     fn test_requested_required_states() {
