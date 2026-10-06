@@ -932,14 +932,23 @@ impl BaseClient {
         // reload (e.g. a client restart that re-fetches `/members`). Only the former
         // should rotate the room key.
         #[cfg(feature = "e2e-encryption")]
-        let previously_known_user_ids = match room.members(RoomMemberships::ACTIVE).await {
-            Ok(members) => {
-                Some(members.into_iter().map(|m| m.user_id().to_owned()).collect::<BTreeSet<_>>())
+        let has_olm_machine = self.olm_machine().await.is_some();
+        #[cfg(feature = "e2e-encryption")]
+        let previously_known_user_ids = if has_olm_machine {
+            match room.members(RoomMemberships::ACTIVE).await {
+                Ok(members) => Some(
+                    members
+                        .into_iter()
+                        .map(|m| m.user_id().to_owned())
+                        .collect::<BTreeSet<_>>(),
+                ),
+                Err(e) => {
+                    tracing::warn!("Error loading known members before a full reload: {e:?}");
+                    None
+                }
             }
-            Err(e) => {
-                tracing::warn!("Error loading known members before a full reload: {e:?}");
-                None
-            }
+        } else {
+            None
         };
 
         let mut chunk = Vec::with_capacity(response.chunk.len());
@@ -1406,12 +1415,16 @@ impl From<&v5::Request> for RequestedRequiredStates {
 /// re-fetching `/members`) must not rotate, or unrelated outbound group sessions
 /// would be needlessly discarded. A genuine membership change must rotate. If the
 /// previously-known membership can't be determined, be conservative and rotate.
+///
+/// This intentionally narrows the MSC4268 precaution: a leave+rejoin that leaves
+/// the set unchanged won't rotate, and device-level membership changes are covered
+/// separately by Olm session recipients/presharing.
 #[cfg(feature = "e2e-encryption")]
 fn reload_requires_room_key_rotation(
     previous: Option<&BTreeSet<OwnedUserId>>,
     current: &BTreeSet<OwnedUserId>,
 ) -> bool {
-    previous.map_or(true, |previous| previous != current)
+    previous.is_none_or(|previous| previous != current)
 }
 
 /// An enum that defines what the [`BaseClient`] should consider a DM room.
@@ -1476,14 +1489,19 @@ mod tests {
         let a_again = BTreeSet::from([owned_user_id!("@a:e.uk")]);
         let a_plus_b = BTreeSet::from([owned_user_id!("@a:e.uk"), owned_user_id!("@b:e.uk")]);
         let b_only = BTreeSet::from([owned_user_id!("@b:e.uk")]);
+        let empty = BTreeSet::new();
 
         // Previously-unknown membership: conservative, rotate.
         assert!(reload_requires_room_key_rotation(None, &a));
         // Same active set (restart re-fetching `/members`): no discard.
         assert!(!reload_requires_room_key_rotation(Some(&a), &a_again));
+        // Empty before and after: no change, no discard.
+        assert!(!reload_requires_room_key_rotation(Some(&empty), &empty));
         // Genuine add / remove: discard.
         assert!(reload_requires_room_key_rotation(Some(&a), &a_plus_b));
         assert!(reload_requires_room_key_rotation(Some(&a_plus_b), &b_only));
+        // Everyone left: discard.
+        assert!(reload_requires_room_key_rotation(Some(&a), &empty));
     }
 
     #[test]
