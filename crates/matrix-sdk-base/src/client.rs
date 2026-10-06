@@ -927,30 +927,6 @@ impl BaseClient {
             return Ok(());
         };
 
-        // Capture the currently-known active members *before* applying the reloaded
-        // member list, so we can tell a genuine membership change apart from a no-op
-        // reload (e.g. a client restart that re-fetches `/members`). Only the former
-        // should rotate the room key.
-        #[cfg(feature = "e2e-encryption")]
-        let has_olm_machine = self.olm_machine().await.is_some();
-        #[cfg(feature = "e2e-encryption")]
-        let previously_known_user_ids = if has_olm_machine {
-            match room.members(RoomMemberships::ACTIVE).await {
-                Ok(members) => Some(
-                    members
-                        .into_iter()
-                        .map(|m| m.user_id().to_owned())
-                        .collect::<BTreeSet<_>>(),
-                ),
-                Err(e) => {
-                    tracing::warn!("Error loading known members before a full reload: {e:?}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         let mut chunk = Vec::with_capacity(response.chunk.len());
         let mut context = Context::default();
 
@@ -969,13 +945,10 @@ impl BaseClient {
                 }
             };
 
-            // TODO: All the actions in this loop used to be done only when the
-            // membership event was not in the store before. This was changed
-            // with the new room API, because e.g. leaving a room makes members
-            // events outdated and they need to be fetched by `members`.
-            // Therefore, they need to be overwritten here, even if they exist.
-            // However, this makes a new problem occur where setting the member
-            // events here potentially races with the sync. See [#1205].
+            // Full reloads overwrite existing member events because, for example,
+            // leaving a room makes the events previously in the store outdated.
+            // Setting the member events here potentially races with the sync.
+            // See [#1205].
             //
             // [#1205]: https://github.com/matrix-org/matrix-rust-sdk/issues/1205
 
@@ -1019,50 +992,30 @@ impl BaseClient {
 
         context.state_changes.ambiguity_maps.insert(room_id.to_owned(), ambiguity_map);
 
-        {
-            let state_store_guard = self.state_store_lock().lock().await;
-
-            let mut room_info = room.clone_info();
-            room_info.mark_members_synced();
-            context.state_changes.add_room(room_info);
-
-            processors::changes::save_and_apply(
-                context,
-                &self.state_store,
-                &state_store_guard,
-                &self.ignore_user_list_changes,
-                None,
-            )
-            .await?;
-        }
-
-        let _ = room.room_member_updates_sender.send(RoomMembersUpdate::FullReload);
+        let mut room_info = room.clone_info();
+        room_info.mark_members_synced();
+        context.state_changes.add_room(room_info);
+        let state_store_guard = self.state_store_lock().lock().await;
+        processors::changes::save_and_apply(
+            context,
+            &self.state_store,
+            &state_store_guard,
+            &self.ignore_user_list_changes,
+            None,
+        )
+        .await?;
 
         #[cfg(feature = "e2e-encryption")]
         if let Some(olm) = self.olm_machine().await.as_ref() {
-            // With the introduction of MSC4268, it is no longer sufficient to check for
-            // changes to session recipients when we send a message, since we may miss
-            // join/leave pairs in our view of the room state. Instead, we should rotate
-            // the room key whenever we fully (re)load the member list *and the active
-            // member set actually changed*. A reload that returns the same membership
-            // (e.g. a restart re-fetching `/members`) must not rotate, or unrelated
-            // outbound group sessions would be needlessly discarded.
-            //
-            // If we couldn't read the previously-known members, be conservative and
-            // rotate.
-            let membership_changed =
-                reload_requires_room_key_rotation(previously_known_user_ids.as_ref(), &user_ids);
-            if membership_changed {
-                tracing::debug!("Rotating room key due to full member list reload");
-                if let Err(e) = olm.discard_room_key(room_id).await {
-                    tracing::warn!("Error discarding room key: {e:?}");
-                }
-            } else {
-                tracing::debug!(
-                    "Not rotating room key: full member list reload had no active member changes"
-                );
+            // A full reload can hide join/leave cycles and membership transitions, so
+            // every successful reload must invalidate the outbound session.
+            tracing::debug!("Rotating room key due to full member list reload");
+            if let Err(e) = olm.discard_room_key(room_id).await {
+                tracing::warn!("Error discarding room key after full member list reload: {e:?}");
             }
         }
+
+        let _ = room.room_member_updates_sender.send(RoomMembersUpdate::FullReload);
 
         Ok(())
     }
@@ -1409,24 +1362,6 @@ impl From<&v5::Request> for RequestedRequiredStates {
     }
 }
 
-/// Returns whether a full member-list reload should rotate the room key.
-///
-/// A reload that leaves the active member set unchanged (e.g. a client restart
-/// re-fetching `/members`) must not rotate, or unrelated outbound group sessions
-/// would be needlessly discarded. A genuine membership change must rotate. If the
-/// previously-known membership can't be determined, be conservative and rotate.
-///
-/// This intentionally narrows the MSC4268 precaution: a leave+rejoin that leaves
-/// the set unchanged won't rotate, and device-level membership changes are covered
-/// separately by Olm session recipients/presharing.
-#[cfg(feature = "e2e-encryption")]
-fn reload_requires_room_key_rotation(
-    previous: Option<&BTreeSet<OwnedUserId>>,
-    current: &BTreeSet<OwnedUserId>,
-) -> bool {
-    previous.is_none_or(|previous| previous != current)
-}
-
 /// An enum that defines what the [`BaseClient`] should consider a DM room.
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
@@ -1442,8 +1377,6 @@ pub enum DmRoomDefinition {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "e2e-encryption")]
-    use std::collections::BTreeSet;
     use std::collections::HashMap;
 
     use futures_util::FutureExt as _;
@@ -1452,8 +1385,6 @@ mod tests {
         BOB, InvitedRoomBuilder, LeftRoomBuilder, SyncResponseBuilder, async_test,
         event_factory::EventFactory, ruma_response_from_json,
     };
-    #[cfg(feature = "e2e-encryption")]
-    use ruma::owned_user_id;
     #[cfg(feature = "unstable-msc4426")]
     use ruma::profile::{
         ProfileFieldValue, StatusProfileField, UserProfileChanges, UserProfileUpdate,
@@ -1470,8 +1401,6 @@ mod tests {
     use serde_json::{json, value::to_raw_value};
     use strass::assert_let;
 
-    #[cfg(feature = "e2e-encryption")]
-    use super::reload_requires_room_key_rotation;
     use super::{BaseClient, RequestedRequiredStates};
     use crate::{
         DmRoomDefinition, RoomDisplayName, RoomState, SessionMeta,
@@ -1481,28 +1410,6 @@ mod tests {
     };
     #[cfg(feature = "unstable-msc4426")]
     use crate::{RoomMemberships, store::StateChanges};
-
-    #[test]
-    #[cfg(feature = "e2e-encryption")]
-    fn member_reload_rotation_decision() {
-        let a = BTreeSet::from([owned_user_id!("@a:e.uk")]);
-        let a_again = BTreeSet::from([owned_user_id!("@a:e.uk")]);
-        let a_plus_b = BTreeSet::from([owned_user_id!("@a:e.uk"), owned_user_id!("@b:e.uk")]);
-        let b_only = BTreeSet::from([owned_user_id!("@b:e.uk")]);
-        let empty = BTreeSet::new();
-
-        // Previously-unknown membership: conservative, rotate.
-        assert!(reload_requires_room_key_rotation(None, &a));
-        // Same active set (restart re-fetching `/members`): no discard.
-        assert!(!reload_requires_room_key_rotation(Some(&a), &a_again));
-        // Empty before and after: no change, no discard.
-        assert!(!reload_requires_room_key_rotation(Some(&empty), &empty));
-        // Genuine add / remove: discard.
-        assert!(reload_requires_room_key_rotation(Some(&a), &a_plus_b));
-        assert!(reload_requires_room_key_rotation(Some(&a_plus_b), &b_only));
-        // Everyone left: discard.
-        assert!(reload_requires_room_key_rotation(Some(&a), &empty));
-    }
 
     #[test]
     fn test_requested_required_states() {
