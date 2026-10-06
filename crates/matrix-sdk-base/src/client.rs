@@ -992,18 +992,20 @@ impl BaseClient {
 
         context.state_changes.ambiguity_maps.insert(room_id.to_owned(), ambiguity_map);
 
-        let mut room_info = room.clone_info();
-        room_info.mark_members_synced();
-        context.state_changes.add_room(room_info);
-        let state_store_guard = self.state_store_lock().lock().await;
-        processors::changes::save_and_apply(
-            context,
-            &self.state_store,
-            &state_store_guard,
-            &self.ignore_user_list_changes,
-            None,
-        )
-        .await?;
+        {
+            let state_store_guard = self.state_store_lock().lock().await;
+            let mut room_info = room.clone_info();
+            room_info.mark_members_synced();
+            context.state_changes.add_room(room_info);
+            processors::changes::save_and_apply(
+                context,
+                &self.state_store,
+                &state_store_guard,
+                &self.ignore_user_list_changes,
+                None,
+            )
+            .await?;
+        }
 
         #[cfg(feature = "e2e-encryption")]
         if let Some(olm) = self.olm_machine().await.as_ref() {
