@@ -1341,7 +1341,9 @@ pub enum DmRoomDefinition {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap};
+    #[cfg(feature = "e2e-encryption")]
+    use std::collections::BTreeSet;
+    use std::collections::HashMap;
 
     use assert_matches2::assert_let;
     #[cfg(feature = "e2e-encryption")]
@@ -1352,6 +1354,8 @@ mod tests {
         BOB, InvitedRoomBuilder, LeftRoomBuilder, SyncResponseBuilder, async_test,
         event_factory::EventFactory, ruma_response_from_json,
     };
+    #[cfg(feature = "e2e-encryption")]
+    use ruma::owned_user_id;
     #[cfg(feature = "unstable-msc4426")]
     use ruma::profile::{
         ProfileFieldValue, StatusProfileField, UserProfileChanges, UserProfileUpdate,
@@ -1361,16 +1365,15 @@ mod tests {
         api::client::{self as api, sync::sync_events::v5},
         event_id,
         events::{StateEventType, room::member::MembershipState},
-        owned_user_id,
         room_id,
         serde::Raw,
         user_id,
     };
     use serde_json::{json, value::to_raw_value};
 
-    use super::{BaseClient, RequestedRequiredStates};
     #[cfg(feature = "e2e-encryption")]
     use super::reload_requires_room_key_rotation;
+    use super::{BaseClient, RequestedRequiredStates};
     use crate::{
         DmRoomDefinition, RoomDisplayName, RoomState, SessionMeta,
         client::ThreadingSupport,
