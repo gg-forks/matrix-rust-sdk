@@ -945,13 +945,10 @@ impl BaseClient {
                 }
             };
 
-            // TODO: All the actions in this loop used to be done only when the
-            // membership event was not in the store before. This was changed
-            // with the new room API, because e.g. leaving a room makes members
-            // events outdated and they need to be fetched by `members`.
-            // Therefore, they need to be overwritten here, even if they exist.
-            // However, this makes a new problem occur where setting the member
-            // events here potentially races with the sync. See [#1205].
+            // Full reloads overwrite existing member events because, for example,
+            // leaving a room makes the events previously in the store outdated.
+            // Setting the member events here potentially races with the sync.
+            // See [#1205].
             //
             // [#1205]: https://github.com/matrix-org/matrix-rust-sdk/issues/1205
 
@@ -997,11 +994,9 @@ impl BaseClient {
 
         {
             let state_store_guard = self.state_store_lock().lock().await;
-
             let mut room_info = room.clone_info();
             room_info.mark_members_synced();
             context.state_changes.add_room(room_info);
-
             processors::changes::save_and_apply(
                 context,
                 &self.state_store,
@@ -1012,20 +1007,17 @@ impl BaseClient {
             .await?;
         }
 
-        let _ = room.room_member_updates_sender.send(RoomMembersUpdate::FullReload);
-
         #[cfg(feature = "e2e-encryption")]
         if let Some(olm) = self.olm_machine().await.as_ref() {
-            // With the introduction of MSC4268, it is no longer sufficient to
-            // check for changes to session recipients when we send a message,
-            // since we may miss join/leave pairs in our view of the room state.
-            // Instead, we should rotate the room key whenever we fully reload
-            // the member list as a precaution.
+            // A full reload can hide join/leave cycles and membership transitions, so
+            // every successful reload must attempt to invalidate the outbound session.
             tracing::debug!("Rotating room key due to full member list reload");
             if let Err(e) = olm.discard_room_key(room_id).await {
-                tracing::warn!("Error discarding room key: {e:?}");
+                tracing::warn!("Error discarding room key after full member list reload: {e:?}");
             }
         }
+
+        let _ = room.room_member_updates_sender.send(RoomMembersUpdate::FullReload);
 
         Ok(())
     }
